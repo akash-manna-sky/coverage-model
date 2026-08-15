@@ -17,13 +17,21 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Serial;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -31,7 +39,15 @@ import java.util.regex.Pattern;
 /**
  * A parser for Go coverage reports.
  *
+ * <p>
+ * Go reports the covered blocks using the package path of a file rather than its file system path. Since there is no
+ * fixed relation between both, the package paths are mapped to files using the {@code go.mod} descriptors of the
+ * analyzed repository: the module with the longest matching prefix defines the directory of a coverage entry. If no
+ * descriptor can be found, then the structure of the package path will be guessed.
+ * </p>
+ *
  * @see <a href="https://go.dev/doc/build-cover">Go coverage profiling support</a>
+ * @see <a href="https://go.dev/ref/mod#go-mod-file">The go.mod file reference</a>
  * @author Ullrich Hafner
  */
 @SuppressWarnings("checkstyle:ClassDataAbstractionCoupling")
@@ -50,6 +66,15 @@ public class GoCovParser extends CoverageParser {
                     + "(?<lineEnd>\\d+)\\.(?<columnEnd>\\d+)\\s+"
                     + "(?<statements>\\d+)\\s+"
                     + "(?<executions>\\d+)");
+
+    /** Pattern to match the module directive of a {@code go.mod} descriptor: such files have no block comments. */
+    private static final Pattern MODULE_PATTERN = Pattern.compile(
+            "^\\s*module\\s+(?<module>\\S+)", Pattern.MULTILINE);
+
+    private static final char PATH_SEPARATOR = '/';
+    private static final String GO_MOD = "go.mod";
+    private static final String VENDOR_DIRECTORY = "vendor";
+    private static final int MAX_MODULE_SEARCH_DEPTH = 10;
 
     /**
      * Creates a new instance of {@link GoCovParser}.
@@ -70,13 +95,15 @@ public class GoCovParser extends CoverageParser {
 
     @Override
     protected ModuleNode parseReport(final Reader reader, final String reportFile, final FilteredLog log) {
+        var goModules = GoModules.discover(reportFile, log);
+
         try (var bufferedReader = new BufferedReader(reader);
                 var lines = bufferedReader.lines();
                 var stream = new LookaheadStream(lines, reportFile)) {
             var fileData = new FileDataCollector();
-            var modules = new HashSet<ModuleNode>();
-            var containerName = new StringBuilder();
+            var modules = new LinkedHashMap<String, ModuleNode>();
             var builder = new TreeStringBuilder();
+            var containerName = goModules.getRootName();
 
             while (stream.hasNext()) {
                 var line = stream.next();
@@ -84,9 +111,10 @@ public class GoCovParser extends CoverageParser {
                 if (matcher.find()) {
                     var fullPath = matcher.group("fullPath");
                     if (containerName.isEmpty()) {
-                        containerName.append(determineContainerName(fullPath));
+                        containerName = determineContainerName(fullPath);
                     }
-                    processLine(matcher, modules, builder, fileData);
+                    processLine(matcher, goModules.resolve(fullPath).orElseGet(() -> guessPath(fullPath)),
+                            modules, builder, fileData);
                 }
             }
 
@@ -94,8 +122,8 @@ public class GoCovParser extends CoverageParser {
             fileData.buildCoverages();
             handleEmptyResults(reportFile, log, modules.isEmpty());
 
-            var container = new ModuleNode(containerName.toString());
-            container.addAllChildren(modules);
+            var container = new ModuleNode(containerName);
+            container.addAllChildren(modules.values());
             return container;
         }
         catch (IOException exception) {
@@ -104,42 +132,28 @@ public class GoCovParser extends CoverageParser {
     }
 
     private String determineContainerName(final String fullPath) {
-        var normalizedPath = fullPath.replace('\\', '/');
-        var parts = StringUtils.split(normalizedPath, '/');
-        
+        var normalizedPath = fullPath.replace('\\', PATH_SEPARATOR);
+        var parts = StringUtils.split(normalizedPath, PATH_SEPARATOR);
+
         if (parts.length == 0) {
             return StringUtils.EMPTY;
         }
-        
+
         if (parts.length >= 3 && parts[0].contains(".")) {
-            return parts[0] + "/" + parts[1];
+            return parts[0] + PATH_SEPARATOR + parts[1];
         }
-        
+
         return parts[0];
     }
 
-    private void processLine(final Matcher matcher, final Set<ModuleNode> modules,
-            final TreeStringBuilder builder, final FileDataCollector fileData) {
-        var fullPath = matcher.group("fullPath");
-        var pathParts = parseGoPath(fullPath);
+    private void processLine(final Matcher matcher, final PathParts pathParts,
+            final Map<String, ModuleNode> modules, final TreeStringBuilder builder,
+            final FileDataCollector fileData) {
+        var module = modules.computeIfAbsent(pathParts.moduleName(), ModuleNode::new);
 
-        var moduleName = pathParts.moduleName;
-        var existingModule = modules.stream()
-                .filter(m -> m.getName().equals(moduleName))
-                .findFirst();
-        
-        ModuleNode module;
-        if (existingModule.isPresent()) {
-            module = existingModule.get();
-        }
-        else {
-            module = new ModuleNode(moduleName);
-            modules.add(module);
-        }
-
-        var packageNode = module.findOrCreatePackageNode(pathParts.packagePath);
-        var fileNode = packageNode.findOrCreateFileNode(pathParts.fileName,
-                builder.intern(PATH_UTIL.getRelativePath(Path.of(pathParts.relativePath))));
+        var packageNode = module.findOrCreatePackageNode(pathParts.packagePath());
+        var fileNode = packageNode.findOrCreateFileNode(pathParts.fileName(),
+                builder.intern(PATH_UTIL.getRelativePath(Path.of(pathParts.relativePath()))));
 
         fileData.addFile(fileNode);
         recordCoverage(matcher, fileNode, fileData);
@@ -159,37 +173,30 @@ public class GoCovParser extends CoverageParser {
     }
 
     /**
-     * Parses a Go package path into module, package, and file components.
-     * Uses module registry for accurate module detection via longest-prefix matching when available.
+     * Guesses the structure of a Go package path. Such a guess cannot be correct for all reports, so it is used only
+     * if no {@code go.mod} descriptor is available.
      *
-     * @param fullPath the full path from the Go coverage report
-     * @return the parsed path components
+     * @param fullPath
+     *         the package path of the coverage report
+     *
+     * @return the guessed path components
      */
-    private PathParts parseGoPath(final String fullPath) {
-        var normalizedPath = fullPath.replace('\\', '/');
-        var parts = StringUtils.split(normalizedPath, '/');
+    private PathParts guessPath(final String fullPath) {
+        var normalizedPath = fullPath.replace('\\', PATH_SEPARATOR);
+        var parts = StringUtils.split(normalizedPath, PATH_SEPARATOR);
 
         if (parts.length == 0) {
-            return new PathParts(StringUtils.EMPTY, StringUtils.EMPTY, 
+            return new PathParts(StringUtils.EMPTY, StringUtils.EMPTY,
                     StringUtils.EMPTY, StringUtils.EMPTY);
         }
 
-        var fileName = parts[parts.length - 1];
         var pathInfo = guessPathStructure(parts);
-
-        var packagePath = buildPackagePath(parts, pathInfo.packageStartIndex());
-        var relativePath = buildRelativePath(parts, pathInfo.packageStartIndex());
-
-        return new PathParts(pathInfo.moduleName(), packagePath, fileName, relativePath);
+        return new PathParts(pathInfo.moduleName(),
+                joinPath(parts, pathInfo.packageStartIndex(), parts.length - 1),
+                parts[parts.length - 1],
+                joinPath(parts, pathInfo.packageStartIndex(), parts.length));
     }
 
-    /**
-     * Guesses path structure using heuristics. Fallback when no {@link ModuleRegistry} is available.
-     * Note: Cannot handle arbitrary Go module depths; use ModuleRegistry for accurate parsing.
-     *
-     * @param parts the path segments split by '/'
-     * @return path information containing module name and package start index
-     */
     private PathInfo guessPathStructure(final String... parts) {
         if (parts.length == 1) {
             return new PathInfo(StringUtils.EMPTY, 0);
@@ -202,23 +209,11 @@ public class GoCovParser extends CoverageParser {
                 : new PathInfo(parts[1], 2);
     }
 
-    private String buildPackagePath(final String[] parts, final int startIndex) {
-        return buildPath(parts, startIndex, parts.length - 1);
-    }
-
-    private String buildRelativePath(final String[] parts, final int startIndex) {
-        return buildPath(parts, startIndex, parts.length);
-    }
-
-    private String buildPath(final String[] parts, final int startIndex, final int endIndex) {
+    private String joinPath(final String[] parts, final int startIndex, final int endIndex) {
         if (startIndex >= endIndex) {
             return StringUtils.EMPTY;
         }
-        var result = new StringBuilder(parts[startIndex]);
-        for (int i = startIndex + 1; i < endIndex; i++) {
-            result.append('/').append(parts[i]);
-        }
-        return result.toString();
+        return String.join(String.valueOf(PATH_SEPARATOR), Arrays.copyOfRange(parts, startIndex, endIndex));
     }
 
     private int asInt(final Matcher matcher, final String group) {
@@ -227,6 +222,120 @@ public class GoCovParser extends CoverageParser {
         }
         catch (NumberFormatException exception) {
             return 0;
+        }
+    }
+
+    /**
+     * Maps the package paths of a coverage report to files, using all {@code go.mod} descriptors that are stored
+     * below the root of the repository that contains the report.
+     */
+    private static final class GoModules {
+        private static final GoModules NO_MODULES = new GoModules(Path.of(StringUtils.EMPTY), List.of());
+
+        private final Path rootDirectory;
+        private final List<GoModule> modules;
+
+        static GoModules discover(final String reportFile, final FilteredLog log) {
+            return findRootDirectory(reportFile)
+                    .map(root -> new GoModules(root, findModules(root, log)))
+                    .orElse(NO_MODULES);
+        }
+
+        private static Optional<Path> findRootDirectory(final String reportFile) {
+            try {
+                var report = Path.of(reportFile).toAbsolutePath().normalize();
+                if (Files.isRegularFile(report)) {
+                    var directory = report.getParent();
+                    while (directory != null) {
+                        if (Files.isRegularFile(directory.resolve(GO_MOD))) {
+                            return Optional.of(directory);
+                        }
+                        directory = directory.getParent();
+                    }
+                }
+            }
+            catch (InvalidPathException exception) {
+                return Optional.empty();
+            }
+            return Optional.empty();
+        }
+
+        private static List<GoModule> findModules(final Path rootDirectory, final FilteredLog log) {
+            try (var descriptors = Files.find(rootDirectory, MAX_MODULE_SEARCH_DEPTH,
+                    (path, attributes) -> GO_MOD.equals(String.valueOf(path.getFileName())))) {
+                return descriptors.filter(descriptor -> isNotVendored(rootDirectory.relativize(descriptor)))
+                        .map(descriptor -> readModule(rootDirectory, descriptor, log))
+                        .flatMap(Optional::stream)
+                        .sorted(Comparator.comparingInt((GoModule module) -> module.prefix().length()).reversed())
+                        .toList();
+            }
+            catch (IOException | UncheckedIOException exception) {
+                log.logException(exception, "Cannot search for Go module descriptors in '%s'", rootDirectory);
+                return List.of();
+            }
+        }
+
+        private static boolean isNotVendored(final Path relativeDescriptor) {
+            for (Path segment : relativeDescriptor) {
+                if (VENDOR_DIRECTORY.equals(segment.toString())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static Optional<GoModule> readModule(final Path rootDirectory, final Path descriptor,
+                final FilteredLog log) {
+            try {
+                var matcher = MODULE_PATTERN.matcher(Files.readString(descriptor));
+                if (matcher.find()) {
+                    return Optional.of(new GoModule(matcher.group("module"),
+                            Objects.requireNonNullElse(descriptor.getParent(), rootDirectory)));
+                }
+                log.logError("Skipping Go module descriptor without module directive: '%s'", descriptor);
+            }
+            catch (IOException exception) {
+                log.logException(exception, "Cannot read Go module descriptor: '%s'", descriptor);
+            }
+            return Optional.empty();
+        }
+
+        private GoModules(final Path rootDirectory, final List<GoModule> modules) {
+            this.rootDirectory = rootDirectory;
+            this.modules = modules;
+        }
+
+        String getRootName() {
+            return modules.stream()
+                    .filter(module -> module.directory().equals(rootDirectory))
+                    .findFirst()
+                    .map(GoModule::name)
+                    .orElse(StringUtils.EMPTY);
+        }
+
+        Optional<PathParts> resolve(final String fullPath) {
+            for (GoModule module : modules) {
+                if (fullPath.startsWith(module.prefix())) {
+                    return Optional.of(split(module, fullPath.substring(module.prefix().length())));
+                }
+            }
+            return Optional.empty();
+        }
+
+        private PathParts split(final GoModule module, final String pathInModule) {
+            var separatorIndex = pathInModule.lastIndexOf(PATH_SEPARATOR);
+            var packagePath = separatorIndex < 0
+                    ? StringUtils.EMPTY
+                    : pathInModule.substring(0, separatorIndex);
+
+            return new PathParts(module.name(), packagePath, pathInModule.substring(separatorIndex + 1),
+                    rootDirectory.relativize(module.directory().resolve(pathInModule)).toString());
+        }
+    }
+
+    private record GoModule(String name, String prefix, Path directory) {
+        GoModule(final String name, final Path directory) {
+            this(name, name + PATH_SEPARATOR, directory);
         }
     }
 
